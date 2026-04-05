@@ -84,6 +84,7 @@ class OrderBookSnapshot:
     best_ask: float         # lowest ask (price to buy the token)
     best_bid: float         # highest bid
     mid: float
+    best_ask_size: float = 0.0   # shares available at best_ask (depth check)
     timestamp: float = field(default_factory=time.time)
 
 

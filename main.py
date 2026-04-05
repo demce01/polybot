@@ -150,13 +150,27 @@ async def run(args: argparse.Namespace) -> None:
         nonlocal _binance_connected
         if asset == "BTC":
             state.btc_price = price
-        else:
+        elif asset == "ETH":
             state.eth_price = price
-        if not _binance_connected:
+        # XRP/SOL flow through market snapshots; not shown in header
+        if not _binance_connected and state.btc_price and state.eth_price:
             _binance_connected = True
             state.add_log(f"Binance connected — BTC ${state.btc_price:,.2f}  ETH ${state.eth_price:,.2f}")
 
     feed.add_callback(on_price)
+
+    # ── Spike queue: BinanceFeed fires immediately on flash move ───────────────
+    # task_opportunity_monitor wakes instantly instead of waiting up to 2 s.
+    spike_queue: asyncio.Queue[tuple[str, int, float]] = asyncio.Queue()
+
+    def on_spike(asset: str, direction: int, pct_move: float) -> None:
+        """Called synchronously from BinanceFeed._handle_message — must not block."""
+        try:
+            spike_queue.put_nowait((asset, direction, pct_move))
+        except asyncio.QueueFull:
+            pass  # queue shouldn't be full, but never block the WS read loop
+
+    feed.add_spike_callback(on_spike)
 
     # ── Dashboard ───────────────────────────────────────────────────────────────
     dashboard = Dashboard()
@@ -197,38 +211,34 @@ async def run(args: argparse.Namespace) -> None:
                     # Ensure price_to_beat is set (uses REST kline if needed)
                     await finder.ensure_price_to_beat(market)
 
-                    cex_price = feed.latest_btc() if market.asset == "BTC" else feed.latest_eth()
+                    cex_price = feed.latest_for(market.asset)
                     ptb = market.price_to_beat
                     delta_pct = ((cex_price - ptb) / ptb * 100) if (ptb and cex_price) else 0.0
 
                     if market.slug not in state.market_snapshots:
                         state.market_snapshots[market.slug] = {
-                            "time_remaining": tr,
+                            "measurement_end": market.measurement_end,
                             "price_to_beat": ptb,
                             "cex_price": cex_price,
                             "delta_pct": delta_pct,
                             "up_ask": None,
                             "down_ask": None,
                             "edge": None,
-                            "interval_secs": market.interval_secs,
                         }
                     else:
                         s = state.market_snapshots[market.slug]
-                        s["time_remaining"] = tr
-                        s["interval_secs"] = market.interval_secs
+                        s["measurement_end"] = market.measurement_end
                         if cex_price:
                             s["cex_price"] = cex_price
                         if ptb:
                             s["price_to_beat"] = ptb
                             s["delta_pct"] = delta_pct
 
-                # Prune snapshots: remove markets that expired >60 s ago
-                # OR markets not yet inside their measurement window (future).
-                # Keep only: currently inside measurement window.
+                # Prune: remove markets whose window has ended
+                import time as _time
                 stale = [
                     slug for slug, snap in list(state.market_snapshots.items())
-                    if snap.get("time_remaining", 1) <= 0 or
-                       snap.get("time_remaining", 0) > snap.get("interval_secs", 900)
+                    if _time.time() >= snap.get("measurement_end", 0)
                 ]
                 for slug in stale:
                     state.market_snapshots.pop(slug, None)
@@ -240,100 +250,135 @@ async def run(args: argparse.Namespace) -> None:
                 state.add_log(f"Scanner error: {exc}")
             await asyncio.sleep(MARKET_SCAN_INTERVAL)
 
+    async def _check_markets_for_asset(asset: str, snap: dict) -> None:
+        """Fetch order books and evaluate signals for markets matching `asset`.
+        If asset is None, checks all active markets (fallback poll path).
+        """
+        from config import DEFAULT_VOL, REALIZED_VOL_WINDOW
+        from probability import estimate_p_up, net_edge, CRYPTO_FEE_RATE
+
+        markets = await finder.get_active_markets()
+        for market in markets:
+            # On spike: only check the relevant asset's markets.
+            # On fallback poll: check all.
+            if asset is not None and market.asset != asset:
+                continue
+
+            if not market.is_in_measurement_window():
+                continue
+
+            await finder.ensure_price_to_beat(market)
+
+            cex_price = feed.latest_for(market.asset)
+            if cex_price is None:
+                continue
+
+            hist = getattr(feed, market.asset.lower(), feed.btc)
+            vol = hist.realized_vol_per_second(
+                REALIZED_VOL_WINDOW,
+                DEFAULT_VOL.get(market.asset, 0.0001),
+            )
+
+            ob = await fetch_order_book(market.up_token_id, clob_rl)
+            if ob is None:
+                continue
+
+            ptb = market.price_to_beat
+            delta_pct = (cex_price - ptb) / ptb * 100 if ptb else 0.0
+            down_ask = 1.0 - ob.best_bid
+
+            tr = market.time_remaining()
+            p_up = estimate_p_up(cex_price, ptb, tr, vol, market.asset) if ptb else 0.5
+            display_edge = abs(net_edge(max(p_up, 1 - p_up), min(ob.best_ask, down_ask)))
+
+            state.market_snapshots[market.slug] = {
+                "measurement_end": market.measurement_end,
+                "price_to_beat": ptb,
+                "cex_price": cex_price,
+                "delta_pct": delta_pct,
+                "up_ask": ob.best_ask,
+                "down_ask": down_ask,
+                "edge": display_edge if display_edge > 0.001 else None,
+            }
+
+            signal = evaluate_opportunity(
+                market=market,
+                ob=ob,
+                current_price=cex_price,
+                vol_per_second=vol,
+                portfolio_value=snap["balance"],
+                price_hist=hist,
+            )
+
+            if signal is not None:
+                state.add_log(
+                    f"SIGNAL: {signal.market.slug} {signal.side.value} | "
+                    f"edge={signal.edge_after_fees:.1%} | "
+                    f"conf={signal.confidence:.1%} | "
+                    f"${signal.suggested_size_usd:.2f}"
+                )
+                pos = await trader.execute_signal(signal)
+                if pos is not None:
+                    all_positions.append(pos)
+                    state.add_log(
+                        f"TRADE: {pos.market.slug} {pos.side.value} "
+                        f"@ {pos.entry_price:.4f} | "
+                        f"shares={pos.size_shares:.1f} | "
+                        f"cost=${pos.total_spent_usd:.2f}"
+                    )
+
     async def task_opportunity_monitor() -> None:
-        """Check each active market for latency-arb opportunities every 2 s."""
+        """
+        Event-driven opportunity monitor.
+
+        Primary path: wakes immediately when BinanceFeed detects a flash spike,
+        checks only markets for that asset.  Exploits the 2.7-second Polymarket
+        lag window without waiting for a poll cycle.
+
+        Fallback path: if no spike arrives within OPPORTUNITY_CHECK_INTERVAL
+        seconds, scans all markets anyway (catches slow drifts and keeps the
+        dashboard order-book columns fresh).
+        """
         while True:
             try:
-                if not portfolio.is_halted:
-                    markets = await finder.get_active_markets()
-                    snap = portfolio.snapshot()
+                if portfolio.is_halted:
+                    await asyncio.sleep(OPPORTUNITY_CHECK_INTERVAL)
+                    continue
 
-                    for market in markets:
-                        if not market.is_in_measurement_window():
-                            continue
+                snap = portfolio.snapshot()
 
-                        # Ensure we have a price_to_beat
-                        await finder.ensure_price_to_beat(market)
+                # Wait for spike OR timeout — whichever comes first
+                try:
+                    asset, direction, pct_move = await asyncio.wait_for(
+                        spike_queue.get(),
+                        timeout=OPPORTUNITY_CHECK_INTERVAL,
+                    )
+                    log.info(
+                        "Spike event: %s %s %.3f%% — checking markets immediately",
+                        asset, "UP" if direction > 0 else "DOWN", pct_move,
+                    )
+                    state.add_log(
+                        f"Spike: {asset} {'▲' if direction > 0 else '▼'} {pct_move:.2f}% — scanning"
+                    )
+                    await _check_markets_for_asset(asset, snap)
 
-                        # Get current CEX price
-                        cex_price = (
-                            feed.latest_btc()
-                            if market.asset == "BTC"
-                            else feed.latest_eth()
-                        )
-                        if cex_price is None:
-                            continue
+                    # Drain any queued spikes for the same asset so we don't
+                    # pile up redundant checks within the same lag window.
+                    while not spike_queue.empty():
+                        try:
+                            spike_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
 
-                        # Get vol estimate
-                        hist = feed.btc if market.asset == "BTC" else feed.eth
-                        from config import DEFAULT_VOL, REALIZED_VOL_WINDOW
-                        vol = hist.realized_vol_per_second(
-                            REALIZED_VOL_WINDOW,
-                            DEFAULT_VOL.get(market.asset, 0.0001),
-                        )
-
-                        # Fetch order book for Up token
-                        ob = await fetch_order_book(market.up_token_id, clob_rl)
-                        if ob is None:
-                            continue
-
-                        # Update market snapshot for dashboard
-                        ptb = market.price_to_beat
-                        delta_pct = (
-                            (cex_price - ptb) / ptb * 100 if ptb else 0.0
-                        )
-                        down_ask = 1.0 - ob.best_bid  # Down token cost = 1 - Up bid
-
-                        # Rough edge estimate for display
-                        from probability import estimate_p_up, net_edge, CRYPTO_FEE_RATE
-                        tr = market.time_remaining()
-                        p_up = estimate_p_up(cex_price, ptb, tr, vol, market.asset) if ptb else 0.5
-                        display_edge = abs(net_edge(max(p_up, 1 - p_up), min(ob.best_ask, down_ask)))
-
-                        state.market_snapshots[market.slug] = {
-                            "time_remaining": tr,
-                            "price_to_beat": ptb,
-                            "cex_price": cex_price,
-                            "delta_pct": delta_pct,
-                            "up_ask": ob.best_ask,
-                            "down_ask": down_ask,
-                            "edge": display_edge if display_edge > 0.001 else None,
-                            "interval_secs": market.interval_secs,
-                        }
-
-                        # Evaluate for trade signal
-                        signal = evaluate_opportunity(
-                            market=market,
-                            ob=ob,
-                            current_price=cex_price,
-                            vol_per_second=vol,
-                            portfolio_value=snap["balance"],
-                            price_hist=hist,
-                        )
-
-                        if signal is not None:
-                            state.add_log(
-                                f"SIGNAL: {signal.market.slug} {signal.side.value} | "
-                                f"edge={signal.edge_after_fees:.1%} | "
-                                f"conf={signal.confidence:.1%} | "
-                                f"${signal.suggested_size_usd:.2f}"
-                            )
-                            pos = await trader.execute_signal(signal)
-                            if pos is not None:
-                                all_positions.append(pos)
-                                state.add_log(
-                                    f"TRADE: {pos.market.slug} {pos.side.value} "
-                                    f"@ {pos.entry_price:.4f} | "
-                                    f"shares={pos.size_shares:.1f} | "
-                                    f"cost=${pos.total_spent_usd:.2f}"
-                                )
+                except asyncio.TimeoutError:
+                    # Fallback poll: refresh all markets
+                    await _check_markets_for_asset(None, snap)
 
             except asyncio.CancelledError:
                 return
             except Exception as exc:
                 log.warning("Opportunity monitor error: %s", exc)
-
-            await asyncio.sleep(OPPORTUNITY_CHECK_INTERVAL)
+                await asyncio.sleep(1.0)
 
     async def task_position_monitor() -> None:
         """
@@ -366,7 +411,7 @@ async def run(args: argparse.Namespace) -> None:
                         continue  # still can't determine start price
 
                     # Get Binance price at measurement_end
-                    hist = feed.btc if pos.market.asset == "BTC" else feed.eth
+                    hist = getattr(feed, pos.market.asset.lower(), feed.btc)
                     end_price = hist.at(mend, tolerance_secs=30)
 
                     if end_price is None:
@@ -453,6 +498,15 @@ async def run(args: argparse.Namespace) -> None:
                 state.total_trades = snap["total_trades"]
                 state.winning_trades = snap["winning_trades"]
                 state.is_halted = snap["is_halted"]
+
+                # Evict expired snapshots every render cycle (100ms resolution)
+                now = time.time()
+                expired = [
+                    slug for slug, s in list(state.market_snapshots.items())
+                    if now >= s.get("measurement_end", 0)
+                ]
+                for slug in expired:
+                    state.market_snapshots.pop(slug, None)
 
                 open_pos = [p for p in all_positions if p.status == PositionStatus.OPEN]
                 resolved_pos = [p for p in all_positions if p.status != PositionStatus.OPEN]

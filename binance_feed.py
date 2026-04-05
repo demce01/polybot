@@ -13,6 +13,7 @@ import logging
 import time
 from typing import Callable, Optional
 
+
 import websockets
 import websockets.exceptions
 
@@ -21,6 +22,9 @@ from config import (
     BINANCE_SESSION_HOURS,
     BINANCE_STREAMS,
     BINANCE_WS_URL,
+    MIN_MOMENTUM_PCT,
+    MOMENTUM_WINDOW_SECS,
+    SPIKE_COOLDOWN_SECS,
 )
 from price_history import PriceHistory
 
@@ -38,21 +42,45 @@ class BinanceFeed:
     def __init__(self) -> None:
         self.btc = PriceHistory(max_age_secs=1800)
         self.eth = PriceHistory(max_age_secs=1800)
+        self.xrp = PriceHistory(max_age_secs=1800)
+        self.sol = PriceHistory(max_age_secs=1800)
         self._running = False
         self._last_reconnect = 0.0
         # Callbacks fired on each new price: (asset, price, timestamp)
         self._callbacks: list[Callable[[str, float, float], None]] = []
+        # Callbacks fired when a spike is detected: (asset, direction, pct_move)
+        # direction is +1 (up spike) or -1 (down spike)
+        self._spike_callbacks: list[Callable[[str, int, float], None]] = []
+        # Per-asset cooldown: don't fire spikes more often than SPIKE_COOLDOWN_SECS
+        self._last_spike_time: dict[str, float] = {}
 
     # ── Public API ──────────────────────────────────────────────────────────────
 
     def add_callback(self, fn: Callable[[str, float, float], None]) -> None:
         self._callbacks.append(fn)
 
+    def add_spike_callback(self, fn: Callable[[str, int, float], None]) -> None:
+        """Register callback fired when a flash spike is detected.
+        Signature: fn(asset: str, direction: int, pct_move: float)
+        direction = +1 for up spike, -1 for down spike.
+        Fires at most once per SPIKE_COOLDOWN_SECS per asset.
+        """
+        self._spike_callbacks.append(fn)
+
     def latest_btc(self) -> Optional[float]:
         return self.btc.latest()
 
     def latest_eth(self) -> Optional[float]:
         return self.eth.latest()
+
+    def latest_xrp(self) -> Optional[float]:
+        return self.xrp.latest()
+
+    def latest_sol(self) -> Optional[float]:
+        return self.sol.latest()
+
+    def latest_for(self, asset: str) -> Optional[float]:
+        return getattr(self, asset.lower(), self.btc).latest()
 
     def btc_at(self, ts: float) -> Optional[float]:
         return self.btc.at(ts)
@@ -136,15 +164,52 @@ class BinanceFeed:
             return
 
         ts = trade_time_ms / 1000.0 if trade_time_ms else time.time()
-        asset = "BTC" if symbol.upper() == "BTCUSDT" else "ETH"
 
-        if asset == "BTC":
-            self.btc.add(price, ts)
-        else:
-            self.eth.add(price, ts)
+        _sym_map = {
+            "BTCUSDT": ("BTC", self.btc),
+            "ETHUSDT": ("ETH", self.eth),
+            "XRPUSDT": ("XRP", self.xrp),
+            "SOLUSDT": ("SOL", self.sol),
+        }
+        entry = _sym_map.get(symbol.upper())
+        if entry is None:
+            return
+        asset, hist = entry
+        hist.add(price, ts)
 
         for cb in self._callbacks:
             try:
                 cb(asset, price, ts)
             except Exception as exc:
                 log.debug("Price callback error: %s", exc)
+
+        # ── Spike detection ─────────────────────────────────────────────────────
+        if self._spike_callbacks:
+            self._check_spike(asset, hist, price, ts)
+
+    def _check_spike(self, asset: str, hist: PriceHistory, price: float, ts: float) -> None:
+        """Fire spike callbacks if price moved ≥ MIN_MOMENTUM_PCT in MOMENTUM_WINDOW_SECS."""
+        threshold = MIN_MOMENTUM_PCT.get(asset, 0.08)
+        change = hist.recent_change_pct(MOMENTUM_WINDOW_SECS)
+        if change is None:
+            return
+
+        abs_change = abs(change)
+        if abs_change < threshold:
+            return
+
+        # Enforce per-asset cooldown
+        now = ts
+        last = self._last_spike_time.get(asset, 0.0)
+        if now - last < SPIKE_COOLDOWN_SECS:
+            return
+
+        self._last_spike_time[asset] = now
+        direction = +1 if change > 0 else -1
+        log.debug("Spike detected: %s %+.3f%% in %ds", asset, change, MOMENTUM_WINDOW_SECS)
+
+        for cb in self._spike_callbacks:
+            try:
+                cb(asset, direction, abs_change)
+            except Exception as exc:
+                log.debug("Spike callback error: %s", exc)

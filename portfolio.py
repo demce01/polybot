@@ -5,14 +5,16 @@ and position lifecycle.
 
 from __future__ import annotations
 
+import csv
 import logging
+import os
 import time
 import uuid
 from datetime import datetime, timezone
 from threading import Lock
 from typing import Optional
 
-from config import MAX_DAILY_DRAWDOWN, MIN_ORDER_USD
+from config import MAX_CONSECUTIVE_LOSSES, MAX_DAILY_DRAWDOWN, MIN_ORDER_USD
 from models import (
     BotState,
     MarketInfo,
@@ -45,8 +47,32 @@ class Portfolio:
         self._daily_resolved_pnl = 0.0           # sum of today's resolved P&L
         self._total_trades = 0
         self._winning_trades = 0
+        self._consecutive_losses = 0
         self._is_halted = False
         self._halt_reason = ""
+
+        # CSV trade log
+        self._csv_path = "trades.csv"
+        self._ensure_csv()
+
+    # ── CSV helpers ──────────────────────────────────────────────────────────────
+
+    def _ensure_csv(self) -> None:
+        if not os.path.exists(self._csv_path):
+            with open(self._csv_path, "w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow([
+                    "event_time", "event_type", "position_id",
+                    "market_slug", "asset", "interval", "side",
+                    "entry_price", "size_shares", "cost_usd", "fee_usd", "total_spent",
+                    "resolved_side", "won", "pnl_usd",
+                ])
+
+    def _log_csv(self, row: list) -> None:
+        try:
+            with open(self._csv_path, "a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(row)
+        except Exception:
+            pass
 
     # ── Public properties ────────────────────────────────────────────────────────
 
@@ -152,6 +178,22 @@ class Portfolio:
                 actual_size_usd,
                 fee,
             )
+
+        self._log_csv([
+            datetime.now(timezone.utc).isoformat(),
+            "OPEN",
+            pos.position_id,
+            signal.market.slug,
+            signal.market.asset,
+            signal.market.interval,
+            signal.side.value,
+            f"{actual_fill_price:.6f}",
+            f"{size_shares:.4f}",
+            f"{actual_size_usd:.4f}",
+            f"{fee:.4f}",
+            f"{total_spent:.4f}",
+            "", "", "",
+        ])
         return pos
 
     # ── Position resolution ──────────────────────────────────────────────────────
@@ -175,6 +217,9 @@ class Portfolio:
             # Add payout to balance (shares × $1 if won; $0 if lost)
             if won:
                 self._balance += pos.size_shares
+                self._consecutive_losses = 0
+            else:
+                self._consecutive_losses += 1
 
             self._daily_resolved_pnl += pnl
             if won:
@@ -199,6 +244,23 @@ class Portfolio:
             # Kill-switch check (only on resolved trades, as specified)
             self._check_kill_switch()
 
+        self._log_csv([
+            datetime.now(timezone.utc).isoformat(),
+            "RESOLVE",
+            pos.position_id,
+            pos.market.slug,
+            pos.market.asset,
+            pos.market.interval,
+            pos.side.value,
+            f"{pos.entry_price:.6f}",
+            f"{pos.size_shares:.4f}",
+            f"{pos.cost_usd:.4f}",
+            f"{pos.fee_paid_usd:.4f}",
+            f"{pos.total_spent_usd:.4f}",
+            resolved_side.value,
+            "1" if won else "0",
+            f"{pnl:.6f}",
+        ])
         return result
 
     # ── Balance sync (live mode) ─────────────────────────────────────────────────
@@ -250,5 +312,12 @@ class Portfolio:
             self._is_halted = True
             self._halt_reason = (
                 f"Daily drawdown {drawdown:.1%} exceeded {MAX_DAILY_DRAWDOWN:.0%} limit"
+            )
+            log.warning("KILL SWITCH ACTIVATED: %s", self._halt_reason)
+            return
+        if self._consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+            self._is_halted = True
+            self._halt_reason = (
+                f"{self._consecutive_losses} consecutive losses — investigate before resuming"
             )
             log.warning("KILL SWITCH ACTIVATED: %s", self._halt_reason)

@@ -84,11 +84,18 @@ async def fetch_order_book(token_id: str, rl: RateLimiter) -> Optional[OrderBook
     best_ask = min(float(a["price"]) for a in asks) if asks else 0.99
     mid = (best_bid + best_ask) / 2.0
 
+    # Sum of shares available within 0.01 of the best ask (depth at top of book)
+    best_ask_size = sum(
+        float(a["size"]) for a in asks
+        if abs(float(a["price"]) - best_ask) < 0.005
+    ) if asks else 0.0
+
     return OrderBookSnapshot(
         token_id=token_id,
         best_ask=best_ask,
         best_bid=best_bid,
         mid=mid,
+        best_ask_size=best_ask_size,
     )
 
 

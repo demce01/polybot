@@ -5,6 +5,7 @@
 # Runtime
 bot.log
 *.log
+trades.csv
 __pycache__/
 *.py[cod]
 *.pyo

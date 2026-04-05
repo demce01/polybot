@@ -24,6 +24,7 @@ from scipy.stats import norm
 from config import (
     CRYPTO_FEE_RATE,
     DEFAULT_VOL,
+    MAX_ENTRY_ASK,
     MAX_REVERSAL_PCT,
     MAX_SPREAD,
     MIN_CONFIDENCE,
@@ -33,6 +34,7 @@ from config import (
     MIN_TIME_REMAINING_FRACTION,
     MIN_WINDOW_ELAPSED_SECS,
     MOMENTUM_WINDOW_SECS,
+    REVERSAL_WINDOW_SECS,
 )
 from models import MarketInfo, OpportunitySignal, OrderBookSnapshot, Side
 
@@ -168,12 +170,11 @@ def _no_reversal(
 ) -> bool:
     """
     Returns True if the price has NOT already reversed strongly against our
-    bet direction in the last 15 seconds.
+    bet direction in the last REVERSAL_WINDOW_SECS seconds.
 
     A reversal means the flash spike has already faded — the lag is gone.
     """
-    reversal_check_window = 15.0
-    change_15s = hist.recent_change_pct(reversal_check_window)
+    change_15s = hist.recent_change_pct(REVERSAL_WINDOW_SECS)
     if change_15s is None:
         return True  # no data — don't block on uncertainty
 
@@ -214,34 +215,45 @@ def evaluate_opportunity(
       10. Net edge after fees > MIN_EDGE_AFTER_FEES
     """
 
+    slug = market.slug
+
     # 1. Need a known start price
     if market.price_to_beat is None:
+        log.debug("%s SKIP gate1: price_to_beat unknown", slug)
         return None
 
     time_remaining = market.time_remaining()
 
     # 2. Must be inside the measurement window
     if not market.is_in_measurement_window():
+        log.debug("%s SKIP gate2: outside measurement window", slug)
         return None
 
     # 3. Too early — let the market establish a direction first
     secs_elapsed = market.seconds_into_window()
     if secs_elapsed < MIN_WINDOW_ELAPSED_SECS:
+        log.debug("%s SKIP gate3: too early (%.0fs elapsed, need %ds)", slug, secs_elapsed, MIN_WINDOW_ELAPSED_SECS)
         return None
 
     # 4. Too close to the end — mean-reversion noise dominates
     min_remaining = market.interval_secs * MIN_TIME_REMAINING_FRACTION
     if time_remaining < min_remaining:
+        log.debug("%s SKIP gate4: too late (%.0fs remaining, need %.0fs)", slug, time_remaining, min_remaining)
         return None
 
     # 5. Spread guard — avoid illiquid or very stale quotes
     spread = ob.best_ask - ob.best_bid
     if spread > MAX_SPREAD:
+        log.debug("%s SKIP gate5: spread %.3f > %.3f", slug, spread, MAX_SPREAD)
         return None
 
     # Guard against degenerate order book prices
     if ob.best_ask <= 0.01 or ob.best_ask >= 0.99:
+        log.debug("%s SKIP gate5: degenerate ask %.3f", slug, ob.best_ask)
         return None
+
+    # Note: depth check removed — PM books are naturally thin ($5–$50 at best ask).
+    # Kelly sizing caps position at 4% of portfolio; FOK order cancels cleanly if unfilled.
 
     # 6-7. Flash-move and reversal checks (require price history)
     # Calculate CEX probability first to determine which side to bet
@@ -267,30 +279,47 @@ def evaluate_opportunity(
     if polymarket_ask <= 0.01 or polymarket_ask >= 0.99:
         return None
 
+    # 5b. Entry ask cap: reject expensive tokens (bad risk/reward).
+    # At ask=0.87: win=$0.13, lose=$0.87 → need >87% real win rate just to break even.
+    # At ask=0.80: win=$0.20, lose=$0.80 → needs 80% win rate (achievable with flash entries).
+    if polymarket_ask > MAX_ENTRY_ASK:
+        log.debug("%s SKIP gate5b: ask %.3f > MAX_ENTRY_ASK %.3f", slug, polymarket_ask, MAX_ENTRY_ASK)
+        return None
+
     if price_hist is not None:
         # 6. Flash-move filter: there must be a RECENT sharp CEX move in our direction.
         #    Without this, we are entering on a slow drift that Polymarket has already
         #    priced — we pay fees into an efficient market.
         if not _momentum_ok(price_hist, side, market.asset):
+            change = price_hist.recent_change_pct(MOMENTUM_WINDOW_SECS)
+            log.debug("%s SKIP gate6: no flash move (%ds chg=%.3f%%, need %.3f%%)",
+                      slug, MOMENTUM_WINDOW_SECS, change or 0.0, MIN_MOMENTUM_PCT.get(market.asset, 0.08))
             return None
 
         # 7. Reversal guard: if the spike has already faded, the lag is gone.
         if not _no_reversal(price_hist, side, market.asset):
+            log.debug("%s SKIP gate7: spike reversed", slug)
             return None
 
     # 8. Lag filter: Polymarket must not have fully priced in the move yet
     lag = cex_p - polymarket_mid
     if abs(lag) < MIN_LAG_PROBABILITY_POINTS:
+        log.debug("%s SKIP gate8: lag %.2fpp < %.2fpp (cex=%.3f pm_mid=%.3f)",
+                  slug, abs(lag)*100, MIN_LAG_PROBABILITY_POINTS*100, cex_p, polymarket_mid)
         return None
 
     # 9. Confidence: GBM must be certain enough to overcome fees + uncertainty
     confidence = max(p_up_cex, 1.0 - p_up_cex)
     if confidence < MIN_CONFIDENCE:
+        log.debug("%s SKIP gate9: confidence %.1f%% < %.1f%%",
+                  slug, confidence*100, MIN_CONFIDENCE*100)
         return None
 
     # 10. Net edge after fees
     edge = net_edge(cex_p, polymarket_ask, fee_rate)
     if edge < MIN_EDGE_AFTER_FEES:
+        log.debug("%s SKIP gate10: edge %.2fpp < %.2fpp (cex=%.3f ask=%.3f)",
+                  slug, edge*100, MIN_EDGE_AFTER_FEES*100, cex_p, polymarket_ask)
         return None
 
     # Kelly sizing

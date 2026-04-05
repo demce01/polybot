@@ -16,7 +16,7 @@ Layout:
 
 from __future__ import annotations
 
-import time
+import time as _time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -125,11 +125,13 @@ def _render_markets(state: BotState) -> Panel:
     t.add_column("Down Ask", justify="right", min_width=9)
     t.add_column("Edge", justify="right", min_width=8)
 
+    now = _time.time()
     for slug, snap in sorted(state.market_snapshots.items()):
-        if snap.get("time_remaining", 0) <= 0:
+        tr = snap.get("measurement_end", 0) - now
+        if tr <= 0:
             continue
         name = slug.replace("-updown-", " ").replace("-", " ").upper()
-        expires = _fmt_countdown(snap.get("time_remaining", 0))
+        expires = _fmt_countdown(tr)
         ptb = f"${snap['price_to_beat']:,.2f}" if snap.get("price_to_beat") else "--"
         cex = f"${snap['cex_price']:,.2f}" if snap.get("cex_price") else "--"
         delta_pct = snap.get("delta_pct", 0.0)

@@ -97,7 +97,7 @@ async def _retry(coro_fn, max_retries: int = MAX_RETRIES):
             if attempt == max_retries - 1:
                 raise
             wait = min(RETRY_BACKOFF_BASE * (2 ** attempt), 60.0) + random.uniform(0, 1)
-            log.warning("Attempt %d/%d failed: %s — retrying in %.1fs", attempt + 1, max_retries, exc, wait)
+            log.warning("Attempt %d/%d failed: %s: %s — retrying in %.1fs", attempt + 1, max_retries, type(exc).__name__, exc, wait)
             await asyncio.sleep(wait)
 
 
@@ -180,9 +180,13 @@ class MarketFinder:
           5. Binance REST kline — last resort.
         """
         if market.price_to_beat is not None:
-            return
+            return  # already set from question text — exact Chainlink price
 
-        symbol = "BTCUSDT" if market.asset == "BTC" else "ETHUSDT"
+        # Question text parse missed — log so we can see the raw question format
+        log.info("%s price_to_beat not in question text: %r", market.slug, market.question[:120])
+
+        _symbols = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "XRP": "XRPUSDT", "SOL": "SOLUSDT"}
+        symbol = _symbols.get(market.asset, "BTCUSDT")
 
         # 1. Fast path: ChainlinkFeed polling cache
         if self._chainlink_feed is not None:
@@ -200,7 +204,7 @@ class MarketFinder:
             return
 
         # 3. Local Binance price history
-        hist = self._feed.btc if market.asset == "BTC" else self._feed.eth
+        hist = getattr(self._feed, market.asset.lower(), self._feed.btc)
         price = hist.at(market.measurement_start, tolerance_secs=10)
         if price is not None:
             market.price_to_beat = price
@@ -296,11 +300,20 @@ class MarketFinder:
         up_idx = outcomes.index("Up") if "Up" in outcomes else 0
         down_idx = outcomes.index("Down") if "Down" in outcomes else 1
 
+        # Extract price-to-beat directly from the question/description text.
+        # Polymarket embeds the exact Chainlink Data Streams reference price when
+        # the market is created, e.g. "Will BTC be above $83,525.00 at 9:05 PM?"
+        question_text = m.get("question", "") or ""
+        desc_text     = m.get("description", "") or ""
+        price_to_beat = _parse_reference_price(question_text + " " + desc_text, asset)
+        if price_to_beat is not None:
+            log.debug("%s price_to_beat from question text: %.2f", slug, price_to_beat)
+
         return MarketInfo(
             event_id=str(event.get("id", "")),
             market_id=str(m.get("id", "")),
             slug=slug,
-            question=m.get("question", slug),
+            question=question_text,
             asset=asset,
             interval=interval,
             interval_secs=interval_secs,
@@ -311,6 +324,7 @@ class MarketFinder:
             slug_ts=slug_ts,
             resolution_source=m.get("resolutionSource", ""),
             is_closed=bool(m.get("closed", False)),
+            price_to_beat=price_to_beat,
         )
 
     async def _fetch_resolution(self, market: MarketInfo) -> Optional[MarketInfo]:
@@ -422,3 +436,45 @@ def current_market_slug(asset: str, interval: str) -> str:
     secs = INTERVALS[interval]
     ts = int(time.time() // secs) * secs
     return f"{asset.lower()}-updown-{interval}-{ts}"
+
+
+def _parse_reference_price(text: str, asset: str) -> Optional[float]:
+    """
+    Extract the Chainlink reference price embedded in a Polymarket market
+    question or description, e.g.:
+      "Will BTC be above $83,525.00 at 9:05 PM?"
+      "Reference price: $2,415.32"
+      "above or below 0.5234"   (XRP/SOL — small numbers, no $ sign)
+
+    Returns None if no plausible price is found.
+    """
+    import re
+
+    # Expected price ranges per asset (sanity filter)
+    _ranges = {
+        "BTC": (1_000,   500_000),
+        "ETH": (100,     30_000),
+        "XRP": (0.01,    50),
+        "SOL": (1,       2_000),
+    }
+    lo, hi = _ranges.get(asset, (0.001, 1_000_000))
+
+    # Pattern 1: dollar sign followed by number (BTC / ETH)
+    for raw in re.findall(r'\$\s*([\d,]+(?:\.\d+)?)', text):
+        try:
+            v = float(raw.replace(',', ''))
+            if lo <= v <= hi:
+                return v
+        except ValueError:
+            continue
+
+    # Pattern 2: plain number (XRP / SOL — no $ sign, small values)
+    for raw in re.findall(r'\b([\d,]+\.\d{2,6})\b', text):
+        try:
+            v = float(raw.replace(',', ''))
+            if lo <= v <= hi:
+                return v
+        except ValueError:
+            continue
+
+    return None
