@@ -1,0 +1,22 @@
+# Environment / secrets
+.env
+*.env
+
+# Runtime
+bot.log
+*.log
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+.claude/
