@@ -170,34 +170,55 @@ class MarketFinder:
 
     async def ensure_price_to_beat(self, market: MarketInfo) -> None:
         """
-        Fetch market.price_to_beat from Polymarket's Gamma API (eventMetadata.priceToBeat).
+        Fetch market.price_to_beat from Polymarket's Gamma API.
 
-        This is the exact Chainlink Data Streams price Polymarket uses for resolution.
-        No Binance or Chainlink RPC fallback — if Gamma hasn't set it yet (first ~60s
-        of a new window) we leave price_to_beat as None and retry next cycle.
-        The MIN_WINDOW_ELAPSED=60s gate ensures we never trade before it's available.
+        Two sources, both return the exact Chainlink Data Streams price:
+          1. Current window: event.eventMetadata.priceToBeat
+             (available once Polymarket processes the previous window close)
+          2. Previous window: event.eventMetadata.finalPrice
+             (always available; finalPrice of window N == priceToBeat of window N+1)
         """
         if market.price_to_beat is not None:
-            return  # already set
+            return
 
-        try:
-            url = f"{GAMMA_API_HOST}/events?slug={market.slug}"
-            await self._gamma_rl.acquire()
-            async with httpx.AsyncClient(timeout=8) as client:
-                r = await client.get(url)
+        async with httpx.AsyncClient(timeout=8) as client:
+
+            # ── Source 1: current window's priceToBeat ────────────────────────
+            try:
+                await self._gamma_rl.acquire()
+                r = await client.get(f"{GAMMA_API_HOST}/events?slug={market.slug}")
                 r.raise_for_status()
                 data = r.json()
-            if data:
-                meta = data[0].get("eventMetadata") or {}
-                raw_ptb = meta.get("priceToBeat")
-                if raw_ptb is not None:
-                    market.price_to_beat = float(raw_ptb)
-                    log.info("%s price_to_beat=%.2f (Gamma eventMetadata)", market.slug, market.price_to_beat)
-                    return
-        except Exception as exc:
-            log.debug("%s Gamma fetch failed: %s", market.slug, exc)
+                if data:
+                    meta = data[0].get("eventMetadata") or {}
+                    raw = meta.get("priceToBeat")
+                    if raw is not None:
+                        market.price_to_beat = float(raw)
+                        log.info("%s price_to_beat=%.2f (current window)", market.slug, market.price_to_beat)
+                        return
+            except Exception as exc:
+                log.debug("%s current-window fetch failed: %s", market.slug, exc)
 
-        log.debug("%s price_to_beat not yet available from Gamma — will retry next cycle", market.slug)
+            # ── Source 2: previous window's finalPrice ────────────────────────
+            # finalPrice of window N  ==  priceToBeat of window N+1
+            prev_ts   = market.slug_ts - market.interval_secs
+            prev_slug = f"{market.asset.lower()}-updown-{market.interval}-{prev_ts}"
+            try:
+                await self._gamma_rl.acquire()
+                r = await client.get(f"{GAMMA_API_HOST}/events?slug={prev_slug}")
+                r.raise_for_status()
+                data = r.json()
+                if data:
+                    meta = data[0].get("eventMetadata") or {}
+                    raw = meta.get("finalPrice")
+                    if raw is not None:
+                        market.price_to_beat = float(raw)
+                        log.info("%s price_to_beat=%.2f (prev window finalPrice)", market.slug, market.price_to_beat)
+                        return
+            except Exception as exc:
+                log.debug("%s prev-window fetch failed: %s", market.slug, exc)
+
+        log.debug("%s price_to_beat not yet available — will retry next cycle", market.slug)
 
     # ── Gamma API fetchers ──────────────────────────────────────────────────────
 
