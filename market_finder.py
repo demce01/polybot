@@ -180,14 +180,34 @@ class MarketFinder:
           5. Binance REST kline — last resort.
         """
         if market.price_to_beat is not None:
-            return  # already set from eventMetadata or question text
+            return  # already set
 
-        log.info("%s price_to_beat missing from Gamma API — falling back to Chainlink/Binance", market.slug)
+        # 1. Re-fetch eventMetadata.priceToBeat from Gamma API.
+        #    On the very first scan the window may be too new and the field is None;
+        #    subsequent calls here will pick it up once Polymarket has set it.
+        try:
+            url = f"{GAMMA_API_HOST}/events?slug={market.slug}"
+            await self._gamma_rl.acquire()
+            async with httpx.AsyncClient(timeout=8) as client:
+                r = await client.get(url)
+                r.raise_for_status()
+                data = r.json()
+            if data:
+                meta = data[0].get("eventMetadata") or {}
+                raw_ptb = meta.get("priceToBeat")
+                if raw_ptb is not None:
+                    market.price_to_beat = float(raw_ptb)
+                    log.debug("%s price_to_beat from Gamma eventMetadata: %.2f", market.slug, market.price_to_beat)
+                    return
+        except Exception as exc:
+            log.debug("%s Gamma re-fetch failed: %s", market.slug, exc)
+
+        log.info("%s price_to_beat not yet in Gamma API — falling back to Chainlink/Binance", market.slug)
 
         _symbols = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "XRP": "XRPUSDT", "SOL": "SOLUSDT"}
         symbol = _symbols.get(market.asset, "BTCUSDT")
 
-        # 1. Fast path: ChainlinkFeed polling cache
+        # 2. Fast path: ChainlinkFeed polling cache
         if self._chainlink_feed is not None:
             price = self._chainlink_feed.get_price_at(market.asset, market.slug_ts)
             if price is not None:
@@ -195,14 +215,14 @@ class MarketFinder:
                 log.debug("%s price_to_beat from Chainlink cache: %.2f", market.slug, price)
                 return
 
-        # 2. One-shot binary search (slow but authoritative; only needed on startup)
+        # 3. One-shot binary search (slow but authoritative; only needed on startup)
         price = await fetch_chainlink_price_at(market.asset, market.slug_ts)
         if price is not None:
             market.price_to_beat = price
             log.debug("%s price_to_beat from Chainlink RPC: %.2f", market.slug, price)
             return
 
-        # 3. Local Binance price history
+        # 4. Local Binance price history
         hist = getattr(self._feed, market.asset.lower(), self._feed.btc)
         price = hist.at(market.measurement_start, tolerance_secs=10)
         if price is not None:
@@ -210,11 +230,11 @@ class MarketFinder:
             log.debug("%s price_to_beat from Binance history: %.2f", market.slug, price)
             return
 
-        # 4. Binance REST kline as last resort
+        # 5. Binance REST kline as last resort
         price = await fetch_binance_open_at(symbol, market.slug_ts)
         if price is not None:
             market.price_to_beat = price
-            log.debug("%s price_to_beat from Binance kline (fallback): %.2f", market.slug, price)
+            log.debug("%s price_to_beat from Binance kline (last resort): %.2f", market.slug, price)
             return
 
         log.debug("%s price_to_beat could not be determined", market.slug)
