@@ -20,7 +20,7 @@ from typing import Optional
 import httpx
 
 from binance_feed import BinanceFeed
-from chainlink import ChainlinkFeed, fetch_chainlink_price_at
+from chainlink import ChainlinkFeed
 from config import (
     ASSETS,
     CLOB_API_RPS,
@@ -170,21 +170,16 @@ class MarketFinder:
 
     async def ensure_price_to_beat(self, market: MarketInfo) -> None:
         """
-        Set market.price_to_beat to the Chainlink oracle price active at slug_ts.
+        Fetch market.price_to_beat from Polymarket's Gamma API (eventMetadata.priceToBeat).
 
-        Priority:
-          1. Already set — skip.
-          2. ChainlinkFeed cache (instant, no RPC call needed — preferred path).
-          3. Chainlink binary search via Polygon RPC (one-shot fallback on startup).
-          4. Local Binance price history (±10 s) — fallback if web3 unavailable.
-          5. Binance REST kline — last resort.
+        This is the exact Chainlink Data Streams price Polymarket uses for resolution.
+        No Binance or Chainlink RPC fallback — if Gamma hasn't set it yet (first ~60s
+        of a new window) we leave price_to_beat as None and retry next cycle.
+        The MIN_WINDOW_ELAPSED=60s gate ensures we never trade before it's available.
         """
         if market.price_to_beat is not None:
             return  # already set
 
-        # 1. Re-fetch eventMetadata.priceToBeat from Gamma API.
-        #    On the very first scan the window may be too new and the field is None;
-        #    subsequent calls here will pick it up once Polymarket has set it.
         try:
             url = f"{GAMMA_API_HOST}/events?slug={market.slug}"
             await self._gamma_rl.acquire()
@@ -197,47 +192,12 @@ class MarketFinder:
                 raw_ptb = meta.get("priceToBeat")
                 if raw_ptb is not None:
                     market.price_to_beat = float(raw_ptb)
-                    log.debug("%s price_to_beat from Gamma eventMetadata: %.2f", market.slug, market.price_to_beat)
+                    log.info("%s price_to_beat=%.2f (Gamma eventMetadata)", market.slug, market.price_to_beat)
                     return
         except Exception as exc:
-            log.debug("%s Gamma re-fetch failed: %s", market.slug, exc)
+            log.debug("%s Gamma fetch failed: %s", market.slug, exc)
 
-        log.info("%s price_to_beat not yet in Gamma API — falling back to Chainlink/Binance", market.slug)
-
-        _symbols = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "XRP": "XRPUSDT", "SOL": "SOLUSDT"}
-        symbol = _symbols.get(market.asset, "BTCUSDT")
-
-        # 2. Fast path: ChainlinkFeed polling cache
-        if self._chainlink_feed is not None:
-            price = self._chainlink_feed.get_price_at(market.asset, market.slug_ts)
-            if price is not None:
-                market.price_to_beat = price
-                log.debug("%s price_to_beat from Chainlink cache: %.2f", market.slug, price)
-                return
-
-        # 3. One-shot binary search (slow but authoritative; only needed on startup)
-        price = await fetch_chainlink_price_at(market.asset, market.slug_ts)
-        if price is not None:
-            market.price_to_beat = price
-            log.debug("%s price_to_beat from Chainlink RPC: %.2f", market.slug, price)
-            return
-
-        # 4. Local Binance price history
-        hist = getattr(self._feed, market.asset.lower(), self._feed.btc)
-        price = hist.at(market.measurement_start, tolerance_secs=10)
-        if price is not None:
-            market.price_to_beat = price
-            log.debug("%s price_to_beat from Binance history: %.2f", market.slug, price)
-            return
-
-        # 5. Binance REST kline as last resort
-        price = await fetch_binance_open_at(symbol, market.slug_ts)
-        if price is not None:
-            market.price_to_beat = price
-            log.debug("%s price_to_beat from Binance kline (last resort): %.2f", market.slug, price)
-            return
-
-        log.debug("%s price_to_beat could not be determined", market.slug)
+        log.debug("%s price_to_beat not yet available from Gamma — will retry next cycle", market.slug)
 
     # ── Gamma API fetchers ──────────────────────────────────────────────────────
 
