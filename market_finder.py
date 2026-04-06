@@ -180,10 +180,9 @@ class MarketFinder:
           5. Binance REST kline — last resort.
         """
         if market.price_to_beat is not None:
-            return  # already set from question text — exact Chainlink price
+            return  # already set from eventMetadata or question text
 
-        # Question text parse missed — log so we can see the raw question format
-        log.info("%s price_to_beat not in question text: %r", market.slug, market.question[:120])
+        log.info("%s price_to_beat missing from Gamma API — falling back to Chainlink/Binance", market.slug)
 
         _symbols = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "XRP": "XRPUSDT", "SOL": "SOLUSDT"}
         symbol = _symbols.get(market.asset, "BTCUSDT")
@@ -300,14 +299,28 @@ class MarketFinder:
         up_idx = outcomes.index("Up") if "Up" in outcomes else 0
         down_idx = outcomes.index("Down") if "Down" in outcomes else 1
 
-        # Extract price-to-beat directly from the question/description text.
-        # Polymarket embeds the exact Chainlink Data Streams reference price when
-        # the market is created, e.g. "Will BTC be above $83,525.00 at 9:05 PM?"
         question_text = m.get("question", "") or ""
-        desc_text     = m.get("description", "") or ""
-        price_to_beat = _parse_reference_price(question_text + " " + desc_text, asset)
-        if price_to_beat is not None:
-            log.debug("%s price_to_beat from question text: %.2f", slug, price_to_beat)
+
+        # Primary source: eventMetadata.priceToBeat — the exact Chainlink Data Streams
+        # price that Polymarket uses for resolution.  Available on both open and
+        # closed markets as soon as the window starts.
+        price_to_beat: Optional[float] = None
+        event_meta = event.get("eventMetadata") or {}
+        if isinstance(event_meta, dict):
+            raw_ptb = event_meta.get("priceToBeat")
+            if raw_ptb is not None:
+                try:
+                    price_to_beat = float(raw_ptb)
+                    log.debug("%s price_to_beat from eventMetadata: %.2f", slug, price_to_beat)
+                except (TypeError, ValueError):
+                    pass
+
+        # Fallback: parse from question/description text (older market format)
+        if price_to_beat is None:
+            desc_text = m.get("description", "") or ""
+            price_to_beat = _parse_reference_price(question_text + " " + desc_text, asset)
+            if price_to_beat is not None:
+                log.debug("%s price_to_beat from question text: %.2f", slug, price_to_beat)
 
         return MarketInfo(
             event_id=str(event.get("id", "")),
